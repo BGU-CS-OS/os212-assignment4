@@ -1,0 +1,136 @@
+#include "types.h"
+#include "stat.h"
+#include "user.h"
+#include "fs.h"
+
+static int
+printint(char * dst, int xx, int base, int sgn)
+{
+    static char digits[] = "0123456789ABCDEF";
+    char buf[16];
+    int i, neg;
+    uint x;
+    uint off = 0;
+
+    neg = 0;
+    if(sgn && xx < 0){
+        neg = 1;
+        x = -xx;
+    } else {
+        x = xx;
+    }
+
+    i = 0;
+    do{
+        buf[i++] = digits[x % base];
+    }while((x /= base) != 0);
+    if(neg)
+        buf[i++] = '-';
+
+    while(--i >= 0)
+        dst[off++] = buf[i];
+
+    return off;
+}
+
+// Print to the given fd. Only understands %d, %x, %p, %s.
+void
+sprintf(char * dst, const char *fmt, ...)
+{
+    char *s;
+    int c, i, state;
+    uint *ap;
+    uint off = 0;
+
+    state = 0;
+    ap = (uint*)(void*)&fmt + 1;
+    for(i = 0; fmt[i]; i++){
+        c = fmt[i] & 0xff;
+        if(state == 0){
+            if(c == '%'){
+                state = '%';
+            } else {
+                dst[off++] = c;
+            }
+        } else if(state == '%'){
+            if(c == 'd'){
+                off += printint(dst + off, *ap, 10, 1);
+                ap++;
+            } else if(c == 'x' || c == 'p'){
+                off += printint(dst + off, *ap, 16, 0);
+                ap++;
+            } else if(c == 's'){
+                s = (char*)*ap;
+                ap++;
+                if(s == 0)
+                    s = "(null)";
+                while(*s != 0){
+                    dst[off++] = *s;
+                    s++;
+                }
+            } else if(c == 'c'){
+                dst[off++] = *ap;
+                ap++;
+            } else if(c == '%'){
+                dst[off++] = c;
+            } else {
+                // Unknown % sequence.  Print it to draw attention.
+                dst[off++] = '%';
+                dst[off++] = c;
+            }
+            state = 0;
+        }
+    }
+    dst[off] = 0;
+}
+
+
+int main() {
+    struct dirent de;
+    char filename[100];
+    char filedata[300];
+    int dirfd, filefd;
+    char* semicolon;
+    char* newline;
+    char buf[100];
+
+    if ((dirfd = open("/proc/inodeinfo", 0)) < 0) {
+        printf(2, "lsnd: cannot open inodeinfo\n");
+        exit();
+    }
+
+    // Skip '.' and '..'
+    read(dirfd, &de, sizeof(de));
+    read(dirfd, &de, sizeof(de));
+
+    while(read(dirfd, &de, sizeof(de)) == sizeof(de)){
+        if(de.inum == 0)
+            continue;
+        sprintf(filename, "/proc/inodeinfo/%s", de.name);
+
+        if ((filefd = open(filename, 0)) < 0) {
+            continue;
+        }
+
+        if (read(filefd, filedata, 300) <= 0) {
+            printf(2, "lsnd: cannot read from inode file\n");
+            exit();
+        }
+
+        semicolon = filedata;
+        while ((semicolon = strchr(semicolon, ':'))) {
+            semicolon += 2;
+            newline = strchr(semicolon, '\n');
+            memmove(buf, semicolon, newline - semicolon);
+            buf[newline - semicolon] = 0;
+            printf(1, buf);
+            printf(1, " ");
+        }
+        printf(1, "\n");
+
+        close(filefd);
+    }
+
+    close(dirfd);
+    exit();
+}

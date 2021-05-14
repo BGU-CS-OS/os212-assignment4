@@ -1,0 +1,759 @@
+--- .gitignore
++++ .gitignore
+@@ -1,16 +1,20 @@
+-*~
+-_*
++cmake-build-debug/
++.idea/
+ *.o
+ *.d
+-*.asm
+ *.sym
+-*.img
+-vectors.S
++*.S
++*.asm
++_*
++
+ bootblock
+ entryother
++fs.img
+ initcode
+ initcode.out
+ kernel
+-kernelmemfs
+ mkfs
++xv6.img
+ .gdbinit
++
++CMakeLists.txt
+--- Makefile
++++ Makefile
+@@ -182,6 +182,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_lsnd\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+--- defs.h
++++ defs.h
+@@ -146,6 +146,7 @@ void            initsleeplock(struct sleeplock*, char*);
+ int             memcmp(const void*, const void*, uint);
+ void*           memmove(void*, const void*, uint);
+ void*           memset(void*, int, uint);
++void            sprintf(char * dst, const char *fmt, ...);
+ char*           safestrcpy(char*, const char*, int);
+ int             strlen(const char*);
+ int             strncmp(const char*, const char*, uint);
+--- fs.c
++++ fs.c
+@@ -445,6 +445,8 @@ stati(struct inode *ip, struct stat *st)
+   st->type = ip->type;
+   st->nlink = ip->nlink;
+   st->size = ip->size;
++  st->dev_dir = 0;
++  st->dev_dir = IS_DEV_DIR(ip);
+ }
+ 
+ //PAGEBREAK!
+@@ -532,7 +534,7 @@ dirlookup(struct inode *dp, char *name, uint *poff)
+   if(dp->type != T_DIR && !IS_DEV_DIR(dp))
+     panic("dirlookup not DIR");
+ 
+-  for(off = 0; off < dp->size; off += sizeof(de)){
++  for(off = 0; off < dp->size || dp->type == T_DEV ; off += sizeof(de)) {
+     if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de)) {
+       if (dp->type == T_DEV)
+         return 0;
+--- ide.c
++++ ide.c
+@@ -28,8 +28,8 @@
+ // idequeue->qnext points to the next buf to be processed.
+ // You must hold idelock while manipulating queue.
+ 
+-static struct spinlock idelock;
+-static struct buf *idequeue;
++struct spinlock idelock;
++struct buf *idequeue;
+ 
+ static int havedisk1;
+ static void idestart(struct buf*);
+--- ls.c
++++ ls.c
+@@ -22,12 +22,36 @@ fmtname(char *path)
+   return buf;
+ }
+ 
++void print_dir(char *path, int fd) {
++    char buf[512];
++    char * p;
++    struct dirent de;
++    struct stat st;
++
++    if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
++        printf(1, "ls: path too long\n");
++        return;
++    }
++    strcpy(buf, path);
++    p = buf+strlen(buf);
++    *p++ = '/';
++    while(read(fd, &de, sizeof(de)) == sizeof(de)){
++        if(de.inum == 0)
++            continue;
++        memmove(p, de.name, DIRSIZ);
++        p[DIRSIZ] = 0;
++        if(stat(buf, &st) < 0){
++            printf(1, "ls: cannot stat %s\n", buf);
++            continue;
++        }
++        printf(1, "%s %d %d %d\n", fmtname(buf), st.type, st.ino, st.size);
++    }
++}
++
+ void
+ ls(char *path)
+ {
+-  char buf[512], *p;
+   int fd;
+-  struct dirent de;
+   struct stat st;
+ 
+   if((fd = open(path, 0)) < 0){
+@@ -46,25 +70,13 @@ ls(char *path)
+     printf(1, "%s %d %d %d\n", fmtname(path), st.type, st.ino, st.size);
+     break;
+ 
++  case T_DEV:
++    if (st.dev_dir) print_dir(path, fd);
++    else printf(1, "%s %d %d %d\n", fmtname(path), st.type, st.ino, st.size);
++    break;
++
+   case T_DIR:
+-    if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+-      printf(1, "ls: path too long\n");
+-      break;
+-    }
+-    strcpy(buf, path);
+-    p = buf+strlen(buf);
+-    *p++ = '/';
+-    while(read(fd, &de, sizeof(de)) == sizeof(de)){
+-      if(de.inum == 0)
+-        continue;
+-      memmove(p, de.name, DIRSIZ);
+-      p[DIRSIZ] = 0;
+-      if(stat(buf, &st) < 0){
+-        printf(1, "ls: cannot stat %s\n", buf);
+-        continue;
+-      }
+-      printf(1, "%s %d %d %d\n", fmtname(buf), st.type, st.ino, st.size);
+-    }
++    print_dir(path, fd);
+     break;
+   }
+   close(fd);
+--- proc.c
++++ proc.c
+@@ -7,10 +7,7 @@
+ #include "proc.h"
+ #include "spinlock.h"
+ 
+-struct {
+-  struct spinlock lock;
+-  struct proc proc[NPROC];
+-} ptable;
++struct proctable ptable;
+ 
+ static struct proc *initproc;
+ 
+--- proc.h
++++ proc.h
+@@ -1,3 +1,5 @@
++#include "spinlock.h"
++
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -56,3 +58,10 @@ struct proc {
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++
++struct proctable {
++    struct spinlock lock;
++    struct proc proc[NPROC];
++};
++
++extern struct proctable ptable;--- procfs.c
++++ procfs.c
+@@ -11,19 +11,428 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "x86.h"
++#include "buf.h"
+ 
+-int 
++#define INODE_BASE       64000
++#define INODE_INUMS_BASE 65000
++
++// macros for minor types of different directories and files
++#define PROC 0
++
++// inums
++#define IDEINFO    (0 + INODE_BASE)
++#define FILESTAT   (1 + INODE_BASE)
++#define INODEINFO  (2 + INODE_BASE)
++#define PROC_BASE  (3 + INODE_BASE)
++
++// indexes of entries in a proc dir
++#define PROCDIR 0
++#define NAME 1
++#define STATUS 2
++#define TYPE_INODE 3
++
++// Per proc we have procdir, then name file and status file
++#define INUMS_PER_PROC 3
++
++ushort procfs_dir_inum = 0;
++
++struct dirent mainprocdir[3] = {
++        {0, "ideinfo"},
++        {0, "filestat"},
++        {0, "inodeinfo"},
++};
++
++struct dirent procdir[INUMS_PER_PROC - 1] = {
++        {0, "name"},
++        {0, "status"},
++};
++
++int is_main_procfs_dir(struct inode *ip) {
++    return ip->minor == PROC && ip->inum < INODE_BASE;
++}
++
++int
+ procfsisdir(struct inode *ip) {
+-  return 0;
++    return is_main_procfs_dir(ip) || ip->inum == INODEINFO ||
++            // In proc's inums and dividable by 3
++            (ip->inum >= INODE_BASE && (ip->inum - INODE_BASE) % INUMS_PER_PROC == 0);
+ }
+ 
+-void 
++void
+ procfsiread(struct inode* dp, struct inode *ip) {
++    ip->valid = 1; // To prevent ilock to read inode from disk
++    ip->nlink = 1; // To prevent iput to write inode to disk
++    ip->type = T_DEV;
++    ip->major = PROCFS;
++}
++
++uint get_numof_proc() {
++    uint numof_proc = 0;
++    for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++        if (p->state != UNUSED) numof_proc++;
++    }
++    return numof_proc;
++}
++
++int read_main_proc_dir(char *dst, int off, struct inode *ip) {
++    struct dirent ent;
++    struct proc * p;
++    uint ent_index = off / sizeof(struct dirent);
++
++    if (ent_index == 0) {
++        memmove(ent.name, ".", 2);
++        ent.inum = ip->inum;
++
++        memmove(dst, &ent, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else if (ent_index == 1) {
++        memmove(ent.name, "..", 3);
++        ent.inum = ROOTINO;
++
++        memmove(dst, &ent, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else {
++        ent_index -= 2;
++    }
++
++    if (ent_index <= 2) {
++        memmove(ent.name, mainprocdir[ent_index].name, DIRSIZ);
++        ent.inum = INODE_BASE + ent_index;
++    } else if (ent_index - 2 > get_numof_proc()) {
++        return 0;
++    } else {
++        uint proc_number = ent_index - 2;
++        for (p = ptable.proc; proc_number > 0; p++) {
++            if (p->state != UNUSED) proc_number--;
++        }
++        p--;
++        if (p->state == UNUSED) return 0;
++        ent.inum = INUMS_PER_PROC * p->pid + PROC_BASE;
++        sprintf(ent.name, "%d", p->pid);
++    }
++
++    memmove(dst, &ent, sizeof(struct dirent));
++
++    return sizeof(struct dirent);
++}
++
++#define min(a, b) ((a) < (b) ? (a) : (b))
++
++struct proc * get_proc(int pid) {
++    for (struct proc *p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
++        if (p->pid == pid) return p;
++    }
++    return 0;
++}
++
++extern struct {
++    struct spinlock lock;
++    struct file file[NFILE];
++} ftable;
++
++uint write_filestat(char* data) {
++    struct inode * inodes[NFILE] = {0};
++
++
++    uint free_fds = 0;
++    uint unique_inodes = 0;
++    uint writable_fds = 0;
++    uint readable_fds = 0;
++
++    for (struct file * file = ftable.file ; file < &ftable.file[NFILE] ; file++) {
++        if (file->ref == 0) {
++            free_fds++;
++        } else {
++            readable_fds += file->readable;
++            writable_fds += file->writable;
++
++            struct inode * inode = file->ip;
++            uint new_inode = 1;
++            for (uint i = 0 ; i < NOFILE ; i++) {
++                if (inodes[i] == inode) new_inode = 0;
++            }
++            if (new_inode) {
++                inodes[unique_inodes++] = inode;
++            }
++        }
++    }
++
++    sprintf(data, "Free fds: %d\n"
++                  "Unique inode fds: %d\n"
++                  "Writeable fds: %d\n"
++                  "Readable fds: %d\n"
++                  "Refs per fds: %d/%d\n",
++                  free_fds,
++                  unique_inodes,
++                  writable_fds,
++                  readable_fds,
++                  unique_inodes,
++                  NFILE - free_fds);
++    return 1;
++}
++
++int read_proc_dir(struct inode *ip, char *dst, int off) {
++    struct dirent ent;
++    uint ent_index = off / sizeof(struct dirent);
++
++    if (ent_index == 0) {
++        memmove(ent.name, ".", 2);
++        ent.inum = ip->inum;
++
++        memmove(dst, &ent, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else if (ent_index == 1) {
++        memmove(ent.name, "..", 3);
++        ent.inum = procfs_dir_inum;
++
++        memmove(dst, &ent, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else {
++        ent_index -= 2;
++    }
++
++    if (ent_index >= INUMS_PER_PROC - 1) return 0;
++
++    memmove(ent.name, procdir[ent_index].name, DIRSIZ);
++    ent.inum = ip->inum + ent_index + 1;
++
++    memmove(dst, &ent, sizeof(struct dirent));
++
++    return sizeof(struct dirent);
++}
++
++uint write_name(uint pid, char * data) {
++    struct proc * p = get_proc(pid);
++    if (!p) return 0;
++
++    memmove(data, p->name, sizeof(p->name));
++
++    return 1;
++}
++
++uint write_status(uint pid, char *data) {
++    char * state = 0;
++    struct proc * p = get_proc(pid);
++    if (!p) return 0;
++
++    switch (p->state) {
++        case UNUSED:
++            state = "UNUSED";
++            break;
++        case EMBRYO:
++            state = "EMBRYO";
++            break;
++        case SLEEPING:
++            state = "SLEEPING";
++            break;
++        case RUNNABLE:
++            state = "RUNNABLE";
++            break;
++        case RUNNING:
++            state = "RUNNING";
++            break;
++        case ZOMBIE:
++            state = "ZOMBIE";
++            break;
++    }
++
++    sprintf(data, "%s %d\n", state, p->sz);
++
++    return 1;
++}
++
++extern struct spinlock idelock;
++extern struct buf *idequeue;
++
++uint write_ideinfo(char *data) {
++    uint waiting_operations = 0;
++    uint read_operations = 0;
++    uint write_operations = 0;
++    acquire(&idelock);
++
++    uint numof_ide = 0;
++    for(struct buf * pp=idequeue; pp; pp=pp->qnext, numof_ide++);
++
++    char block_list[8*numof_ide + 1];
++    uint off = 0;
++
++    block_list[0] = 0;
++
++    for(struct buf * pp=idequeue; pp; pp=pp->qnext) {
++        char cur_str[8];
++        int waiting_operation = 0;
++
++        if (pp->flags & B_DIRTY) {
++            write_operations++;
++            waiting_operation = 1;
++        } else if (!(pp->flags & B_VALID)) {
++            read_operations++;
++            waiting_operation = 1;
++        }
++
++        if (waiting_operation) {
++            waiting_operations++;
++
++            sprintf(cur_str, "%d,%d;", pp->dev, pp->blockno);
++            memmove(block_list + off, cur_str, strlen(cur_str) + 1);
++            off += strlen(cur_str);
++        }
++    }
++
++    release(&idelock);
++
++    sprintf(data, "Waiting operations: %d\n"
++                  "Read waiting operations: %d\n"
++                  "Write waiting operations: %d\n"
++                  "Working blocks: %s\n",
++                  waiting_operations,
++                  read_operations,
++                  write_operations,
++                  block_list);
++    return 1;
++}
++
++extern struct {
++    struct spinlock lock;
++    struct inode inode[NINODE];
++} icache;
++
++int read_inode_info(char *dst, int off, struct inode *ip) {
++    struct inode *cur_ip;
++    struct dirent res;
++
++    int ent_index = off / sizeof(struct dirent);
++
++    if (ent_index == 0) {
++        memmove(res.name, ".", 2);
++        res.inum = ip->inum;
++
++        memmove(dst, &res, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else if (ent_index == 1) {
++        memmove(res.name, "..", 3);
++        res.inum = procfs_dir_inum;
++
++        memmove(dst, &res, sizeof(struct dirent));
++        return sizeof(struct dirent);
++    } else {
++        ent_index -= 2;
++    }
++
++    uint inode_index = 0;
++
++    for(cur_ip = &icache.inode[0]; cur_ip < &icache.inode[NINODE] && ent_index >= 0; cur_ip++) {
++        if (cur_ip->ref != 0) {
++            ent_index--;
++            inode_index++;
++        }
++    }
++
++    // asked for too large entry
++    if (ent_index >= 0) return 0;
++
++    sprintf(res.name, "%d", inode_index);
++    res.inum = INODE_INUMS_BASE + inode_index;
++
++    memmove(dst, &res, sizeof(struct dirent));
++
++    return sizeof(struct dirent);
++}
++
++uint write_inode_data(struct inode *ip, char *data) {
++    struct inode *inode;
++
++    uint inode_index = ip->inum - INODE_INUMS_BASE;
++
++    for(inode = &icache.inode[0]; inode < &icache.inode[NINODE] && inode_index > 0; inode++) {
++        if (inode->ref != 0) {
++            inode_index--;
++        }
++    }
++
++    if (inode_index > 0) return 0;
++
++    char * type = "";
++    switch (inode->type) {
++        case T_FILE:
++            type = "FILE";
++            break;
++        case T_DIR:
++            type = "DIR";
++            break;
++        case T_DEV:
++            type = "DEV";
++            break;
++    }
++
++    sprintf(data, "Device: %d\n"
++                  "Inode number: %d\n"
++                  "is valid: %d\n"
++                  "type: %s\n"
++                  "major minor: %d,%d\n"
++                  "hard links: %d\n"
++                  "blocks used: %d\n",
++                  inode->dev,
++                  inode->inum,
++                  inode->valid,
++                  type,
++                  inode->major,
++                  inode->minor,
++                  inode->nlink,
++                  inode->type == T_DEV ? 0 : inode->size / BSIZE);
++    return 1;
+ }
+ 
+ int
+ procfsread(struct inode *ip, char *dst, int off, int n) {
+-  return 0;
++    char data[300];
++    uint success = 0;
++    uint file_type;
++    uint pid = 0;
++
++    if (is_main_procfs_dir(ip)) {
++        procfs_dir_inum = ip->inum;
++        return read_main_proc_dir(dst, off, ip);
++    }
++
++    file_type = ip->inum;
++    if (ip->inum >= PROC_BASE) {
++        file_type = (ip->inum - PROC_BASE) % INUMS_PER_PROC;
++        pid = (ip->inum - PROC_BASE) / INUMS_PER_PROC;
++    }
++
++    if (ip->inum >= INODE_INUMS_BASE) {
++        file_type = TYPE_INODE;
++    }
++
++    switch (file_type) {
++        case TYPE_INODE:
++            success = write_inode_data(ip, data);
++            break;
++        case PROCDIR:
++            return read_proc_dir(ip, dst, off);
++        case NAME:
++            success = write_name(pid, data);
++            break;
++        case STATUS:
++            success = write_status(pid, data);
++            break;
++        case IDEINFO:
++            success = write_ideinfo(data);
++            break;
++        case INODEINFO:
++            return read_inode_info(dst, off, ip);
++        case FILESTAT:
++            success = write_filestat(data);
++            break;
++    }
++
++    if (!success) return 0;
++
++    n = min(n, strlen(data) - off);
++    memmove(dst, data + off, n);
++
++    return n;
+ }
+ 
+ int
+--- spinlock.h
++++ spinlock.h
+@@ -1,3 +1,6 @@
++#ifndef __SPINLOCK_H__
++#define __SPINLOCK_H__
++
+ // Mutual exclusion lock.
+ struct spinlock {
+   uint locked;       // Is the lock held?
+@@ -9,3 +12,4 @@ struct spinlock {
+                      // that locked the lock.
+ };
+ 
++#endif--- stat.h
++++ stat.h
+@@ -8,4 +8,5 @@ struct stat {
+   uint ino;    // Inode number
+   short nlink; // Number of links to file
+   uint size;   // Size of file in bytes
++  uint dev_dir;
+ };
+--- string.c
++++ string.c
+@@ -1,6 +1,87 @@
+ #include "types.h"
+ #include "x86.h"
+ 
++static int
++printint(char * dst, int xx, int base, int sgn)
++{
++    static char digits[] = "0123456789ABCDEF";
++    char buf[16];
++    int i, neg;
++    uint x;
++    uint off = 0;
++
++    neg = 0;
++    if(sgn && xx < 0){
++        neg = 1;
++        x = -xx;
++    } else {
++        x = xx;
++    }
++
++    i = 0;
++    do{
++        buf[i++] = digits[x % base];
++    }while((x /= base) != 0);
++    if(neg)
++        buf[i++] = '-';
++
++    while(--i >= 0)
++        dst[off++] = buf[i];
++
++    return off;
++}
++
++// Print to the given fd. Only understands %d, %x, %p, %s.
++void
++sprintf(char * dst, const char *fmt, ...)
++{
++    char *s;
++    int c, i, state;
++    uint *ap;
++    uint off = 0;
++
++    state = 0;
++    ap = (uint*)(void*)&fmt + 1;
++    for(i = 0; fmt[i]; i++){
++        c = fmt[i] & 0xff;
++        if(state == 0){
++            if(c == '%'){
++                state = '%';
++            } else {
++                dst[off++] = c;
++            }
++        } else if(state == '%'){
++            if(c == 'd'){
++                off += printint(dst + off, *ap, 10, 1);
++                ap++;
++            } else if(c == 'x' || c == 'p'){
++                off += printint(dst + off, *ap, 16, 0);
++                ap++;
++            } else if(c == 's'){
++                s = (char*)*ap;
++                ap++;
++                if(s == 0)
++                    s = "(null)";
++                while(*s != 0){
++                    dst[off++] = *s;
++                    s++;
++                }
++            } else if(c == 'c'){
++                dst[off++] = *ap;
++                ap++;
++            } else if(c == '%'){
++                dst[off++] = c;
++            } else {
++                // Unknown % sequence.  Print it to draw attention.
++                dst[off++] = '%';
++                dst[off++] = c;
++            }
++            state = 0;
++        }
++    }
++    dst[off] = 0;
++}
++
+ void*
+ memset(void *dst, int c, uint n)
+ {
+--- sysfile.c
++++ sysfile.c
+@@ -382,7 +382,7 @@ sys_chdir(void)
+     return -1;
+   }
+   ilock(ip);
+-  if(ip->type != T_DIR){
++  if(ip->type != T_DIR && !IS_DEV_DIR(ip)){
+     iunlockput(ip);
+     end_op();
+     return -1;
+--- user.h
++++ user.h
+@@ -1,3 +1,6 @@
++#ifndef __USER_H__
++#define __USER_H__
++
+ struct stat;
+ struct rtcdate;
+ 
+@@ -37,3 +40,5 @@ void* memset(void*, int, uint);
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++
++#endif
