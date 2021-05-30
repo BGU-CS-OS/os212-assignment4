@@ -113,11 +113,12 @@ fileread(struct file *f, uint64 addr, int n)
 
   if(f->type == FD_PIPE){
     r = piperead(f->pipe, addr, n);
-  } else if(f->type == FD_DEVICE){
+    //Read from every device beside PROCFS
+  } else if(f->type == FD_DEVICE && f->major != PROCFS){
     if(f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
       return -1;
     r = devsw[f->major].read(f->ip, 1, addr, f->off, n);
-  } else if(f->type == FD_INODE){
+  } else if(f->type == FD_INODE || (f->type == FD_DEVICE && f->major == PROCFS)){
     ilock(f->ip);
     if((r = readi(f->ip, 1, addr, f->off, n)) > 0)
       f->off += r;
